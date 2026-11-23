@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import datetime as _dt
 import hashlib
 import os
@@ -88,31 +89,55 @@ def ensure_planning_files(project_dir: Path, template: str = "default") -> dict[
     }
 
 
-def write_attestation(project_dir: Path, plan_dir: Path) -> str:
-    """Lock task_plan.md the way attest-plan.sh does: a lowercase SHA-256 hex line."""
+@contextmanager
+def _attestation_writer(project_dir: Path, plan_dir: Path):
+    target = attestation_path_for(project_dir, plan_dir)
+    lock = target.with_name(target.name + ".writer-lock")
+    claim = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        yield target
+    finally:
+        try:
+            held = os.fstat(claim)
+        finally:
+            os.close(claim)
+        try:
+            if os.path.samestat(held, lock.lstat()):
+                lock.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _write_locked_attestation(plan_dir: Path, target: Path) -> str:
     plan_file = plan_dir / "task_plan.md"
     digest = hashlib.sha256(plan_file.read_bytes()).hexdigest()
-    target = attestation_path_for(project_dir, plan_dir)
     tmp = target.with_name(target.name + ".tmp")
     tmp.write_text(digest + "\n", encoding="ascii")
     os.replace(tmp, target)
     return digest
 
 
+def write_attestation(project_dir: Path, plan_dir: Path) -> str:
+    with _attestation_writer(project_dir, plan_dir) as target:
+        return _write_locked_attestation(plan_dir, target)
+
+
 def apply_v3_mode(project_dir: Path, plan_dir: Path, mode: str) -> dict[str, Any]:
     """Write the v3 markers init-session.sh writes: counter reset, nonce, .mode, attestation."""
     if mode not in {"autonomous", "gated"}:
         raise ValueError(f"unknown mode: {mode!r} (expected autonomous or gated)")
-    (plan_dir / ".stop_blocks").write_text("0\n", encoding="ascii")
-    try:
-        (plan_dir / ".gate_last_ledger").unlink()
-    except FileNotFoundError:
-        pass
-    (plan_dir / ".nonce").write_text(secrets.token_hex(8) + "\n", encoding="ascii")
-    marker = "autonomous gate\n" if mode == "gated" else "autonomous\n"
-    (plan_dir / ".mode").write_text(marker, encoding="ascii")
-    digest = write_attestation(project_dir, plan_dir)
-    return {"marker": marker.strip(), "attestation": digest}
+    with _attestation_writer(project_dir, plan_dir) as target:
+        (plan_dir / ".stop_blocks").write_text("0\n", encoding="ascii")
+        try:
+            (plan_dir / ".gate_last_ledger").unlink()
+        except FileNotFoundError:
+            pass
+        (plan_dir / ".nonce").write_text(secrets.token_hex(8) + "\n", encoding="ascii")
+        marker = "autonomous gate\n" if mode == "gated" else "autonomous\n"
+        (plan_dir / ".mode").write_text(marker, encoding="ascii")
+        digest = _write_locked_attestation(plan_dir, target)
+        return {"marker": marker.strip(), "attestation": digest}
+
 
 
 
@@ -215,23 +240,12 @@ def init_plan(
 
 
 def phase_counts(task_plan: str) -> dict[str, int]:
-    counts = {"complete": 0, "in_progress": 0, "pending": 0, "failed": 0, "total": 0}
-    for line in task_plan.splitlines():
-        normalized = line.strip().lower()
-        if normalized.startswith("### phase"):
-            counts["total"] += 1
-        if "**status:**" not in normalized:
-            continue
-        if "complete" in normalized:
-            counts["complete"] += 1
-        elif "in_progress" in normalized:
-            counts["in_progress"] += 1
-        elif "failed" in normalized or "blocked" in normalized:
-            counts["failed"] += 1
-        elif "pending" in normalized:
-            counts["pending"] += 1
-    if counts["total"] == 0:
-        for line in task_plan.splitlines():
+    lines, invalid_structure = _unfenced_lines(task_plan)
+    phases = _plan_phases(lines, ignore_case=True)
+    counts = _phase_totals(phases, invalid_structure)
+    counts["failed"] = sum(states in (["failed"], ["blocked"]) for _, states in phases)
+    if counts["total"] == 0 and not invalid_structure:
+        for line in lines:
             stripped = line.strip()
             if not (stripped.startswith("|") and stripped.endswith("|")):
                 continue
@@ -239,13 +253,13 @@ def phase_counts(task_plan: str) -> dict[str, int]:
             if len(cells) < 2 or cells[0] in {"phase", "error"} or set(cells[0]) == {"-"}:
                 continue
             status = cells[1]
-            if status in counts:
+            if status in ("complete", "in_progress", "pending", "failed"):
                 counts[status] += 1
                 counts["total"] += 1
         if counts["total"] == 0:
-            for marker, key in (("[complete]", "complete"), ("[in_progress]", "in_progress"), ("[pending]", "pending")):
-                counts[key] = task_plan.count(marker)
-            counts["total"] = counts["complete"] + counts["in_progress"] + counts["pending"]
+            for state in ("complete", "in_progress", "pending"):
+                counts[state] = sum(line.count(f"[{state}]") for line in lines)
+                counts["total"] += counts[state]
     return counts
 
 
@@ -308,34 +322,70 @@ def extract_current_phase(task_plan: str) -> str:
     return "No phase found"
 
 
-def first_in_progress_phase(task_plan: str) -> str:
-    """Heading of the first phase whose status is in_progress, '### ' stripped."""
-    heading = ""
+def _unfenced_lines(task_plan: str) -> tuple[list[str], bool]:
+    lines: list[str] = []
+    fence = ""
+    fence_length = 0
+    malformed_heading = False
+    if task_plan.startswith("\ufeff"):
+        task_plan = task_plan[1:]
     for line in task_plan.splitlines():
-        if line.startswith("### "):
-            heading = line[4:]
+        if fence:
+            if re.match(r"^ {0,3}" + re.escape(fence) + r"{" + str(fence_length) + r",}[ \t]*$", line):
+                fence = ""
             continue
-        if "**Status:** in_progress" in line or "[in_progress]" in line:
-            return heading
-    return ""
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if marker and (marker[1][0] != "`" or "`" not in line[marker.end():]):
+            fence = marker[1][0]
+            fence_length = len(marker[1])
+            continue
+        if re.match(r"^ {0,3}>", line):
+            continue
+        if re.match(r"^ {0,3}### Phase(?:[0-9:]|-[0-9])", line, re.IGNORECASE):
+            malformed_heading = True
+        lines.append(line)
+    return lines, bool(fence) or malformed_heading
+
+
+def _plan_phases(lines: list[str], *, ignore_case: bool = False) -> list[tuple[str, list[str]]]:
+    flags = re.IGNORECASE if ignore_case else 0
+    phases: list[tuple[str, list[str]]] = []
+    phase = None
+    for line in lines:
+        if re.match(r"^ {0,3}### Phase(?:[ \t]|$)", line, flags):
+            phase = (line.lstrip(" ")[4:], [])
+            phases.append(phase)
+        elif re.match(r"^ {0,3}#{1,3}(?:[ \t]|$)", line):
+            phase = None
+        if phase is not None:
+            for match in re.finditer(r"\*\*Status:\*\*[ \t]+(pending|in_progress|complete|failed|blocked)(?![A-Za-z0-9_])|\[(pending|in_progress|complete|failed|blocked)\]", line, flags):
+                phase[1].append((match[1] or match[2]).lower())
+    return phases
+
+
+def first_in_progress_phase(task_plan: str) -> str:
+    lines, _ = _unfenced_lines(task_plan)
+    return next((heading for heading, states in _plan_phases(lines) if "in_progress" in states), "")
+
+
+def _phase_totals(phases: list[tuple[str, list[str]]], invalid_structure: bool) -> dict[str, int]:
+    counts = {"total": len(phases), "complete": 0, "in_progress": 0, "pending": 0}
+    for _, states in phases:
+        if "in_progress" in states:
+            counts["in_progress"] += 1
+        elif states == ["complete"]:
+            counts["complete"] += 1
+        elif states == ["pending"]:
+            counts["pending"] += 1
+    if invalid_structure:
+        counts["invalid_structure"] = True
+    return counts
 
 
 def gate_counts(task_plan: str) -> dict[str, int]:
-    """Phase counts the way check-complete.sh --gate counts them.
-
-    ``total`` is the number of lines containing ``### Phase``. Each status is
-    the per-field maximum of the primary ``**Status:** <state>`` form and the
-    inline ``[<state>]`` marker form, so a plan that mixes both formats can
-    never let an in_progress phase slip past the gate.
-    """
-    lines = task_plan.splitlines()
-    total = sum(1 for line in lines if "### Phase" in line)
-    counts: dict[str, int] = {"total": total}
-    for state in ("complete", "in_progress", "pending"):
-        primary = sum(1 for line in lines if f"**Status:** {state}" in line)
-        inline = sum(1 for line in lines if f"[{state}]" in line)
-        counts[state] = max(primary, inline)
-    return counts
+    """Count native statuses in real phases, retaining explicit active evidence."""
+    lines, invalid_structure = _unfenced_lines(task_plan)
+    return _phase_totals(_plan_phases(lines), invalid_structure)
 
 
 # The strictness-LOWERING mode tokens. Everything else raises strictness, and

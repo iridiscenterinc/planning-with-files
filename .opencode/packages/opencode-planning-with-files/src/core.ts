@@ -491,28 +491,52 @@ export function compactionNote(root: string, planDir: string): string {
 // gate (parity with check-complete.sh --gate)
 // ---------------------------------------------------------------------------
 
-export function gateCounts(text: string): { total: number; complete: number; in_progress: number; pending: number } {
-  const lines = text.split(/\r?\n/)
-  const count = (needle: string) => lines.filter((line) => line.includes(needle)).length
-  const field = (state: string) => Math.max(count(`**Status:** ${state}`), count(`[${state}]`))
+function planPhases(text: string) {
+  const phases: { heading: string; statuses: string[] }[] = []
+  let phase: (typeof phases)[number] | null = null
+  let fence = ""
+  let fenceLength = 0
+  let malformedHeading = false
+  for (const line of text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    if (fence) {
+      if (new RegExp(`^ {0,3}${fence}{${fenceLength},}[ \\t]*$`).test(line)) fence = ""
+      continue
+    }
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})/)
+    if (marker && (marker[1][0] !== "`" || !line.slice(marker[0].length).includes("`"))) {
+      fence = marker[1][0]; fenceLength = marker[1].length; continue
+    }
+    if (/^ {0,3}>/.test(line)) continue
+    if (/^ {0,3}### Phase(?:[ \t]|$)/.test(line)) {
+      phase = { heading: line.trimStart().slice(4), statuses: [] }
+      phases.push(phase)
+    } else if (/^ {0,3}### Phase(?:[0-9:]|-[0-9])/.test(line)) {
+      malformedHeading = true
+      phase = null
+    } else if (/^ {0,3}#{1,3}(?:[ \t]|$)/.test(line)) phase = null
+    if (phase) {
+      for (const match of line.matchAll(/\*\*Status:\*\*[ \t]+(pending|in_progress|complete)(?![A-Za-z0-9_])|\[(pending|in_progress|complete)\]/g)) {
+        phase.statuses.push(match[1] || match[2])
+      }
+    }
+  }
+  return { phases, invalidStructure: fence !== "" || malformedHeading }
+}
+
+export function gateCounts(text: string): { total: number; complete: number; in_progress: number; pending: number; invalid_structure?: true } {
+  const { phases, invalidStructure } = planPhases(text)
+  const count = (state: string) => phases.filter((p) => p.statuses.length === 1 && p.statuses[0] === state).length
   return {
-    total: count("### Phase"),
-    complete: field("complete"),
-    in_progress: field("in_progress"),
-    pending: field("pending"),
+    total: phases.length,
+    complete: count("complete"),
+    in_progress: phases.filter((p) => p.statuses.includes("in_progress")).length,
+    pending: count("pending"),
+    ...(invalidStructure ? { invalid_structure: true } : {}),
   }
 }
 
 export function firstInProgressPhase(text: string): string {
-  let heading = ""
-  for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith("### ")) {
-      heading = line.slice(4)
-      continue
-    }
-    if (line.includes("**Status:** in_progress") || line.includes("[in_progress]")) return heading
-  }
-  return ""
+  return planPhases(text).phases.find((p) => p.statuses.includes("in_progress"))?.heading ?? ""
 }
 
 function readCounter(target: string): number {
@@ -728,26 +752,48 @@ function copyTemplates(planDir: string, templatesDir: string | null, template: s
   return created
 }
 
-export function writeAttestation(root: string, planDir: string): string {
-  const digest = crypto.createHash("sha256").update(fs.readFileSync(path.join(planDir, "task_plan.md"))).digest("hex")
+function withAttestationWriter<T>(root: string, planDir: string, write: (target: string) => T): T {
   const target = attestationPathFor(root, planDir)
+  const lock = target + ".writer-lock"
+  const claim = fs.openSync(lock, "wx", 0o600)
+  try {
+    return write(target)
+  } finally {
+    try {
+      const held = fs.fstatSync(claim, { bigint: true })
+      const current = fs.lstatSync(lock, { bigint: true, throwIfNoEntry: false })
+      if (current && held.dev === current.dev && held.ino === current.ino) fs.unlinkSync(lock)
+    } finally {
+      fs.closeSync(claim)
+    }
+  }
+}
+
+function writeLockedAttestation(planDir: string, target: string): string {
+  const digest = crypto.createHash("sha256").update(fs.readFileSync(path.join(planDir, "task_plan.md"))).digest("hex")
   const tmp = `${target}.tmp.${process.pid}.${crypto.randomBytes(4).toString("hex")}`
   writeText(tmp, `${digest}\n`)
   fs.renameSync(tmp, target)
   return digest
 }
 
+export function writeAttestation(root: string, planDir: string): string {
+  return withAttestationWriter(root, planDir, target => writeLockedAttestation(planDir, target))
+}
+
 export function applyV3Mode(root: string, planDir: string, mode: "autonomous" | "gated"): { marker: string; attestation: string } {
-  writeText(path.join(planDir, ".stop_blocks"), "0\n")
-  try {
-    fs.unlinkSync(path.join(planDir, ".gate_last_ledger"))
-  } catch {
-    // absent is fine
-  }
-  writeText(path.join(planDir, ".nonce"), `${crypto.randomBytes(8).toString("hex")}\n`)
-  const marker = mode === "gated" ? "autonomous gate" : "autonomous"
-  writeText(path.join(planDir, ".mode"), `${marker}\n`)
-  return { marker, attestation: writeAttestation(root, planDir) }
+  return withAttestationWriter(root, planDir, target => {
+    writeText(path.join(planDir, ".stop_blocks"), "0\n")
+    try {
+      fs.unlinkSync(path.join(planDir, ".gate_last_ledger"))
+    } catch {
+      // absent is fine
+    }
+    writeText(path.join(planDir, ".nonce"), `${crypto.randomBytes(8).toString("hex")}\n`)
+    const marker = mode === "gated" ? "autonomous gate" : "autonomous"
+    writeText(path.join(planDir, ".mode"), `${marker}\n`)
+    return { marker, attestation: writeLockedAttestation(planDir, target) }
+  })
 }
 
 export function initPlan(
@@ -857,11 +903,16 @@ export function checkComplete(root: string, env: Env): { complete: boolean; mess
         : "No task_plan.md found. Run pwf_init first.",
     }
   }
-  const text = readText(path.join(resolved.planDir, "task_plan.md")) ?? ""
+  const text = readText(path.join(resolved.planDir, "task_plan.md"))
+  if (text === null) {
+    return { complete: false, message: "[planning-with-files] Plan read error: phase completion unavailable." }
+  }
   const counts = gateCounts(text)
-  const complete = counts.total > 0 && counts.complete >= counts.total
+  const complete = !counts.invalid_structure && counts.total > 0 && counts.complete >= counts.total
   const message = complete
     ? `[planning-with-files] ALL PHASES COMPLETE (${counts.complete}/${counts.total}). If the user has additional work, add new phases to task_plan.md before starting.`
-    : `[planning-with-files] Plan incomplete: ${counts.complete}/${counts.total} phases complete, ${counts.in_progress} in_progress.`
+    : counts.invalid_structure
+      ? "[planning-with-files] Plan format error: phase completion unavailable."
+      : `[planning-with-files] Plan incomplete: ${counts.complete}/${counts.total} phases complete, ${counts.in_progress} in_progress.`
   return { complete, message, plan_id: planIdFor(root, resolved.planDir), counts }
 }

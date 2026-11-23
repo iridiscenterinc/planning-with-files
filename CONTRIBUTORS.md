@@ -119,6 +119,7 @@ These amazing people have contributed code, documentation, or significant improv
 - **[Ankit Kumar Jha](https://github.com/ankitjha1405)** — [PR #364](https://github.com/OthmanAdi/planning-with-files/pull/364)
   - Aligned the localized `/plan` commands with plan selection and the initializer.
   - Added shell `-Help` handling ([PR #365](https://github.com/OthmanAdi/planning-with-files/pull/365)) and a FAQ for tasks nearing compaction ([PR #366](https://github.com/OthmanAdi/planning-with-files/pull/366)).
+  - Proposed and implemented the initial opt-in checkbox progress support for [PR #367](https://github.com/OthmanAdi/planning-with-files/pull/367).
 
 - **[Dylan Duan](https://github.com/Kiddo4993)** — [PR #351](https://github.com/OthmanAdi/planning-with-files/pull/351)
   - Aligned Claude plugin commands with selected-plan, initialization and validation contracts, with focused command checks.
@@ -194,7 +195,8 @@ These amazing people have contributed code, documentation, or significant improv
   - Added a bounded retry for the PowerShell active-pointer pre-check race during concurrent named-plan initialization, preserving root and pointer validation.
   - Added explicit root and named attestation targets so a roadmap can be attested without changing the active ticket plan, with selection and failure-path regressions.
 
-- **[@kuei51307-hub](https://github.com/kuei51307-hub)**, [PR #243](https://github.com/OthmanAdi/planning-with-files/pull/243), [PR #244](https://github.com/OthmanAdi/planning-with-files/pull/244), [PR #248](https://github.com/OthmanAdi/planning-with-files/pull/248), [PR #249](https://github.com/OthmanAdi/planning-with-files/pull/249), [PR #251](https://github.com/OthmanAdi/planning-with-files/pull/251), [PR #267](https://github.com/OthmanAdi/planning-with-files/pull/267), [PR #277](https://github.com/OthmanAdi/planning-with-files/pull/277), [PR #279](https://github.com/OthmanAdi/planning-with-files/pull/279), [PR #282](https://github.com/OthmanAdi/planning-with-files/pull/282), [PR #290](https://github.com/OthmanAdi/planning-with-files/pull/290), [PR #333](https://github.com/OthmanAdi/planning-with-files/pull/333)
+- **[@kuei51307-hub](https://github.com/kuei51307-hub)**, [PR #243](https://github.com/OthmanAdi/planning-with-files/pull/243), [PR #244](https://github.com/OthmanAdi/planning-with-files/pull/244), [PR #248](https://github.com/OthmanAdi/planning-with-files/pull/248), [PR #249](https://github.com/OthmanAdi/planning-with-files/pull/249), [PR #251](https://github.com/OthmanAdi/planning-with-files/pull/251), [PR #267](https://github.com/OthmanAdi/planning-with-files/pull/267), [PR #277](https://github.com/OthmanAdi/planning-with-files/pull/277), [PR #279](https://github.com/OthmanAdi/planning-with-files/pull/279), [PR #282](https://github.com/OthmanAdi/planning-with-files/pull/282), [PR #290](https://github.com/OthmanAdi/planning-with-files/pull/290), [PR #333](https://github.com/OthmanAdi/planning-with-files/pull/333), [PR #381](https://github.com/OthmanAdi/planning-with-files/pull/381)
+  - Counted statuses within Markdown phase boundaries and shared fixtures across the completion reports and native integrations.
   - Fixed active-plan display and listing for UTF-8 BOM-prefixed pointers, with regression coverage across the synchronized shell helpers.
   - Made IDE sync verification report missing canonical sources, with subprocess tests for read-only verification and unchanged sync behavior.
   - Bounded session catchup to exact planning filenames across the canonical scanners and the Hermes, MastraCode, and OpenCode adapters, with lookalike regression coverage.
@@ -533,4 +535,4 @@ If you've contributed and don't see your name here, please open an issue! We wan
 
 **Total Contributors:** 115 (114 community contributors plus the maintainer)
 
-*Last updated: 2026-11-10*
+*Last updated: 2026-11-20*
